@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime
 import json
 import logging
 import os
-import threading
-from threading import Timer
+import time
 from typing import Any
 
 import aiofiles
 import aiohttp
 from packaging.version import parse as version_parse
-import websocket
 
 from homeassistant.components.cover import CoverDeviceClass, CoverEntityFeature
 from homeassistant.const import CONF_HOST, CONF_PIN, CONF_USERNAME, Platform
@@ -55,152 +54,139 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-logging.getLogger("websocket").setLevel(logging.CRITICAL)
+
+# Bounds the TCP connect plus the HTTP upgrade so a stalled attempt is retried.
+CONNECT_TIMEOUT = 15
+# Ping interval; aiohttp drops the socket when the pong is half this late.
+HEARTBEAT = 20
+# The device emits wifiStrength/memStatus every few seconds, so a minute of
+# silence means the link is dead even if TCP has not noticed yet.
+RECEIVE_TIMEOUT = 60
+MAX_BACKOFF = 30
+# A connection that stayed up this long resets the backoff.
+STABLE_AFTER = 60
 
 
-class SocketListener(threading.Thread):
+class SocketListener:
     """A listener of sockets."""
 
-    def __init__(
-        self, hass: HomeAssistant, url: str, onpacket, onopen, onclose, onerror
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, url: str, onpacket, onopen, onclose) -> None:
         """Initialize a new socket listener."""
-        super().__init__()
+        self.hass = hass
         self.url = url
         self.onpacket = onpacket
         self.onopen = onopen
         self.onclose = onclose
-        self.onerror = onerror
-        self.connected = False
-        self.main_loop = None
-        self.ws_app = None
-        self.hass = hass
-        self._should_stop = False
+        # None until the first attempt, so a device that is down at startup
+        # still reports disconnected.
+        self.connected: bool | None = None
         self.filter = None
-        self.running_future = None
-        self.reconnects = 0
-        self._connect_timer = None
-
-    def __enter__(self):
-        """Start the thread."""
-        self.start()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Stop and join the thread."""
-        self.stop()
-
-    def stop(self):
-        """Cancel event stream and join the thread."""
-        _LOGGER.debug("Stopping event thread")
-        self._should_stop = True
-        if self.ws_app:  # and self.connected:
-            self.ws_app.close()
-
-        _LOGGER.debug("Joining event thread")
-        if self.is_alive():
-            self.join()
-        _LOGGER.debug("Event thread joined")
-
-    async def connect(self):
-        """Start up the web socket."""
-        self.main_loop = asyncio.get_event_loop()
-        self.ws_app = websocket.WebSocketApp(
-            self.url,
-            on_message=self.ws_onmessage,
-            on_error=self.ws_onerror,
-            on_close=self.ws_onclose,
-            on_open=self.ws_onopen,
-            keep_running=True,
-        )
-        self.main_loop.run_in_executor(None, self.ws_begin)
-
-    def reconnect(self):
-        """Reconnect to the web socket."""
-        if self._connect_timer is not None:
-            self._connect_timer.cancel()
-        self.reconnects = self.reconnects + 1
-        self.main_loop = asyncio.get_event_loop()
-        try:
-            self.ws_app = websocket.WebSocketApp(
-                self.url,
-                on_message=self.ws_onmessage,
-                on_error=self.ws_onerror,
-                on_close=self.ws_onclose,
-                on_open=self.ws_onopen,
-                keep_running=True,
-            )
-            self.main_loop.run_in_executor(None, self.ws_begin)
-            self._connect_timer = None
-            self.connected = True
-
-        except websocket.WebSocketAddressException:
-            self._connect_timer = Timer(
-                min(10 * self.reconnects / 2, 20), self.reconnect
-            )
-            self._connect_timer.start()
-        except websocket.WebSocketTimeoutException:
-            self._connect_timer = Timer(
-                min(10 * self.reconnects / 2, 20), self.reconnect
-            )
-            self._connect_timer.start()
-        except websocket.WebSocketConnectionClosedException:
-            self._connect_timer = Timer(
-                min(10 * self.reconnects / 2, 20), self.reconnect
-            )
-            self._connect_timer.start()
+        self._task: asyncio.Task | None = None
+        self._stopping = False
 
     def set_filter(self, arr: Any) -> None:
         """Filter for the events."""
         self.filter = arr.copy()
 
-    def close(self) -> None:
-        """Synonym for stop."""
-        self.stop()
+    def start(self) -> None:
+        """Start the connect/reconnect loop."""
+        self._stopping = False
+        self._task = self.hass.async_create_background_task(
+            self._run(), name=f"espsomfy_rts socket {self.url}"
+        )
 
-    def ws_begin(self) -> None:
-        """Begin the socket."""
-        self.running_future = self.ws_app.run_forever(ping_interval=20, ping_timeout=15)
-        # print("Fell out of run_runforever")
-        if not self._should_stop:
-            self.hass.loop.call_soon_threadsafe(self.reconnect)
+    async def stop(self) -> None:
+        """Stop the loop and close the socket."""
+        self._stopping = True
+        if self._task is None:
+            return
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
 
-    def ws_onerror(self, wsapp, exception):
-        """Socket error."""
-        # print(f"We have an error {exception}")
-        self.hass.loop.call_soon_threadsafe(self.onerror, exception)
+    async def _run(self) -> None:
+        """Keep the socket connected until stopped."""
+        session = async_get_clientsession(self.hass)
+        backoff = 1
+        while True:
+            opened_at = None
+            reason: Any = "closed by device"
+            try:
+                async with asyncio.timeout(CONNECT_TIMEOUT):
+                    ws = await session.ws_connect(
+                        self.url, heartbeat=HEARTBEAT, autoping=True
+                    )
+                async with ws:
+                    opened_at = time.monotonic()
+                    _LOGGER.info("Connected to %s", self.url)
+                    self._set_connected(True)
+                    while True:
+                        msg = await ws.receive(timeout=RECEIVE_TIMEOUT)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            self._handle_message(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            reason = ws.exception() or "socket error"
+                            break
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
+                            break
+            except TimeoutError:
+                reason = "timed out" if opened_at else "connect timed out"
+            except (aiohttp.ClientError, OSError) as err:
+                reason = err
+            finally:
+                if self._stopping:
+                    self.connected = False
 
-    def ws_onclose(self, wsapp, status, msg):
-        """Socket closed."""
-        # print(f"The socket was closed {status}")
-        self.connected = False
-        if not self._should_stop:
-            self.hass.loop.call_soon_threadsafe(self.onclose)
+            if opened_at is not None:
+                uptime = time.monotonic() - opened_at
+                if uptime > STABLE_AFTER:
+                    backoff = 1
+                _LOGGER.info(
+                    "Disconnected from %s after %ds: %s, retrying in %ds",
+                    self.url,
+                    uptime,
+                    reason,
+                    backoff,
+                )
+            else:
+                _LOGGER.debug(
+                    "Connecting to %s failed: %s, retrying in %ds",
+                    self.url,
+                    reason,
+                    backoff,
+                )
+            self._set_connected(False)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
 
-    def ws_onopen(self, wsapp):
-        """Open the socket."""
-        self.connected = True
-        self.hass.loop.call_soon_threadsafe(self.onopen)
+    def _set_connected(self, state: bool) -> None:
+        """Report a change of connection state."""
+        if self.connected == state:
+            return
+        self.connected = state
+        if state:
+            self.onopen()
+        else:
+            self.onclose()
 
-    def ws_onmessage(self, wsapp, message: str):
+    def _handle_message(self, message: str) -> None:
         """Process the incoming message."""
         try:
-            if message is None:
-                _LOGGER.debug("Got an empty socket payload")
-            elif message.startswith("42["):
+            if message.startswith("42["):
                 ndx = message.find(",")
                 event = message[3:ndx]
                 if not self.filter or event in self.filter:
                     payload = message[ndx + 1 : -1]
-                    # print(f"Event:{event} Payload:{payload}")
                     data = json.loads(payload)
                     data["event"] = event
-                    self.hass.loop.call_soon_threadsafe(self.onpacket, data)
-            elif message.lower() == "connected":
-                self.reconnects = 0
-                self.connected = True
-        except Exception as e:
-            _LOGGER.debug(e.message)
-            raise
+                    self.onpacket(data)
+        except ValueError:
+            _LOGGER.debug("Bad socket payload %r", message, exc_info=True)
 
 
 class ESPSomfyController(DataUpdateCoordinator):
@@ -268,19 +254,18 @@ class ESPSomfyController(DataUpdateCoordinator):
     async def ws_close(self) -> None:
         """Close the tasks and sockets."""
         if self.ws_listener is not None:
-            self.ws_listener.close()
+            await self.ws_listener.stop()
+            self.ws_listener = None
 
     async def ws_connect(self):
         """Connect to WebSocket."""
-        if self.ws_listener is not None:
-            self.ws_listener.close()
+        await self.ws_close()
         self.ws_listener = SocketListener(
             self.hass,
             self.api.get_sock_url(),
             self.ws_onpacket,
             self.ws_onopen,
             self.ws_onclose,
-            self.ws_onerror,
         )
         self.ws_listener.set_filter(
             [
@@ -297,7 +282,7 @@ class ESPSomfyController(DataUpdateCoordinator):
                 EVT_MEMSTATUS,
             ]
         )
-        await self.ws_listener.connect()
+        self.ws_listener.start()
 
     async def create_backup(self) -> bool:
         """Create a backup of the configuration and stores it in HA."""
@@ -312,7 +297,7 @@ class ESPSomfyController(DataUpdateCoordinator):
         if self.api.get_host() != host:
             # Tear down the socket
             self.api.set_host(host)
-            self.ws_connect()
+            await self.ws_connect()
 
     def ensure_group_configured(self, data):
         """Ensure the group exists on Home Assistant."""
@@ -433,11 +418,6 @@ class ESPSomfyController(DataUpdateCoordinator):
                 self.async_set_updated_data(data=data)
 
             coro.add_done_callback(handle_connected)
-
-    def ws_onerror(self, exception):
-        """Error on the socket connection."""
-        data = {"event": EVT_CONNECTED, "connected": False}
-        self.async_set_updated_data(data=data)
 
     def ws_onclose(self):
         """Socket closed."""
