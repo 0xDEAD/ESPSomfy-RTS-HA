@@ -67,6 +67,20 @@ MAX_BACKOFF = 30
 STABLE_AFTER = 60
 
 
+def get_device(
+    hass: HomeAssistant, unique_id: str, config_entry_id: str
+) -> dr.DeviceEntry | None:
+    """Get the controller device owned by the config entry."""
+    registry = dr.async_get(hass)
+    # async_get_device is deprecated and stops working in HA 2027.8; older HA
+    # versions lack the per-config-entry lookup that replaces it.
+    if hasattr(registry, "async_get_device_by_identifier"):
+        return registry.async_get_device_by_identifier(
+            (DOMAIN, unique_id), config_entry_id
+        )
+    return registry.async_get_device(identifiers={(DOMAIN, unique_id)})
+
+
 class SocketListener:
     """A listener of sockets."""
 
@@ -302,8 +316,7 @@ class ESPSomfyController(DataUpdateCoordinator):
     def ensure_group_configured(self, data):
         """Ensure the group exists on Home Assistant."""
         uuid = f"{self.unique_id}_group{data['groupId']}"
-        devices = dr.async_get(self.hass)
-        device = devices.async_get_device({(DOMAIN, self.unique_id)})
+        device = get_device(self.hass, self.unique_id, self.config_entry_id)
         entities = er.async_get(self.hass)
         for entity in er.async_entries_for_config_entry(entities, self.config_entry_id):
             if entity.unique_id == uuid:
@@ -331,8 +344,7 @@ class ESPSomfyController(DataUpdateCoordinator):
         """Ensure the shade exists on Home Assistant."""
         uuid = f"{self.unique_id}_{data['shadeId']}"
 
-        devices = dr.async_get(self.hass)
-        device = devices.async_get_device({(DOMAIN, self.unique_id)})
+        device = get_device(self.hass, self.unique_id, self.config_entry_id)
 
         entities = er.async_get(self.hass)
 
@@ -580,11 +592,12 @@ class ESPSomfyAPI:
             self._config["inetAvailable"] = data["inetAvailable"]
         if cver != new_ver:
             # print(f"Version: {cver} to {new_ver}")
-            dev_registry = dr.async_get(self.hass)
-            if dev := dev_registry.async_get_device(
-                identifiers={(DOMAIN, f"espsomfy_{self.server_id}")}
+            if dev := get_device(
+                self.hass, f"espsomfy_{self.server_id}", self._config_entry_id
             ):
-                dev_registry.async_update_device(dev.id, sw_version=new_ver)
+                dr.async_get(self.hass).async_update_device(
+                    dev.id, sw_version=new_ver
+                )
         self._config["version"] = new_ver
         v = version_parse(new_ver)
         if (
